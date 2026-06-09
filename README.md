@@ -333,7 +333,7 @@ GitHub Gist installer
 
 Version
 
-Pipper v1.0.0
+Pipper v1.0.1
 
 Production release for Pythonista.
 
