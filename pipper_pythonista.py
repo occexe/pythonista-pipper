@@ -95,6 +95,8 @@ TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
 
 PIP_TARGET_PLACEHOLDER = "__PIPPER_TARGET_PLACEHOLDER__"
 
+PIPPER_VERSION = "1.0.1"
+
 # Pythonista often ships/loads older pip internals where `pip install --hash`
 # is not available or unreliable in in-process runpy mode. Keep hash mode
 # disabled by default for compatibility. Users can still verify bootstrap pip
@@ -115,6 +117,13 @@ VERBOSE_PREFLIGHT = False
 PIP_RUN_COUNT = 0
 PIP_RUN_WARNING_THRESHOLDS = {5, 10, 15, 20}
 
+PIPPER_CONFIG = {
+    "verbose_preflight": False,
+    "wheel_only": False,
+    "export_dir": None,
+}
+PIPPER_CONFIG_PATH = None
+
 
 # =============================================================================
 # Display helpers
@@ -132,7 +141,7 @@ def _section(text):
 
 
 def _notice(text):
-    print("ℹ️  " + str(text))
+    print("i️  " + str(text))
 
 
 def _warning(text):
@@ -855,6 +864,40 @@ def _normalize_pip_args_for_pythonista(args):
     return args
 
 
+
+def _print_pythonista_pip_failure_advice(output_text):
+    if not output_text:
+        return
+
+    lowered = output_text.lower()
+
+    if "subprocesses are not supported on ios" in lowered:
+        _warning(
+            "Pythonista blocked a subprocess. This usually means the package or one "
+            "of its dependencies needs a source build."
+        )
+        print("   Try:")
+        print("   • Enable wheel-only mode (w)")
+        print("   • Reinstall with dependencies disabled")
+        print("   • Install a pure wheel-compatible dependency manually")
+        return
+
+    if "no matching distribution found" in lowered:
+        _warning(
+            "No matching distribution was found. On Pythonista this often means no "
+            "compatible pure Python wheel exists for this package/version."
+        )
+        print("   Try wheel-only mode or a different package version.")
+        return
+
+    if "failed building wheel" in lowered or "error: legacy-install-failure" in lowered:
+        _warning(
+            "A wheel/source build failed. Pythonista generally cannot build packages "
+            "that require compilation or subprocess-based setup steps."
+        )
+        print("   Try a pure-Python wheel version or install without dependencies.")
+
+
 def run_pip_command(args):
     """
     Pythonista-compatible in-process pip runner.
@@ -910,7 +953,16 @@ def run_pip_command(args):
         except Exception:
             pass
 
+    pip_output_text = ""
+    try:
+        pip_output_text = tee_stdout.getvalue() + "\n" + tee_stderr.getvalue()
+    except Exception:
+        pip_output_text = ""
+
     PIP_RUN_COUNT += 1
+
+    if not ok:
+        _print_pythonista_pip_failure_advice(pip_output_text)
 
     if PIP_RUN_COUNT in PIP_RUN_WARNING_THRESHOLDS:
         _warning(
@@ -1193,9 +1245,16 @@ def _build_pip_args_for_pypi_package(canonical_name, version=None, allow_hashes=
                 PIP_TARGET_PLACEHOLDER,
                 "--no-compile",
                 "--no-deps",
+            ]
+
+            if is_wheel_only_enabled():
+                args.extend(["--only-binary", ":all:"])
+
+            args.extend([
                 "--require-hashes",
                 pkg_spec,
-            ] + hash_args
+            ])
+            args += hash_args
 
             return args, resolved_version, True
 
@@ -1213,6 +1272,9 @@ def _build_pip_args_for_pypi_package(canonical_name, version=None, allow_hashes=
         PIP_TARGET_PLACEHOLDER,
         "--no-compile",
     ]
+
+    if is_wheel_only_enabled():
+        args.extend(["--only-binary", ":all:"])
 
     if not install_deps:
         args.append("--no-deps")
@@ -2127,6 +2189,8 @@ def _runtime_report(site_packages_dir, gist_folder_dir):
     print("pip --hash mode enabled: {}".format("yes" if ENABLE_PIP_REQUIRE_HASHES else "no"))
     print("pip progress bar: off")
     print("verbose preflight: {}".format("yes" if VERBOSE_PREFLIGHT else "no"))
+    print("wheel-only mode: {}".format("yes" if is_wheel_only_enabled() else "no"))
+    print("Config path: {}".format(PIPPER_CONFIG_PATH or "(not loaded)"))
     print("pip operations this session: {}".format(PIP_RUN_COUNT))
     print("PyPI metadata cache entries: {}".format(len(_PYPI_METADATA_CACHE)))
 
@@ -2281,15 +2345,20 @@ def _find_user_documents_dir(site_packages_dir):
 
 
 def _resolve_export_dir(site_packages_dir):
-    export_base = _find_user_documents_dir(site_packages_dir)
-    export_dir = os.path.join(export_base, "pipper_exports")
+    configured = PIPPER_CONFIG.get("export_dir") if isinstance(PIPPER_CONFIG, dict) else None
+
+    if configured:
+        export_dir = os.path.expanduser(str(configured))
+    else:
+        export_base = _find_user_documents_dir(site_packages_dir)
+        export_dir = os.path.join(export_base, "pipper_exports")
 
     try:
         os.makedirs(export_dir, exist_ok=True)
     except OSError:
         export_dir = os.path.join(site_packages_dir, "pipper_exports")
         os.makedirs(export_dir, exist_ok=True)
-        _warning("Could not write to Documents; exporting inside site-packages instead.")
+        _warning("Could not write to preferred export folder; exporting inside site-packages instead.")
 
     return export_dir
 
@@ -2641,6 +2710,124 @@ def prompt_session_tools():
 
 
 
+
+# =============================================================================
+# Persistent config helpers
+# =============================================================================
+
+def _get_default_config_path(site_packages_dir):
+    base = _find_user_documents_dir(site_packages_dir)
+    return os.path.join(base, "pipper_config.json")
+
+
+def load_pipper_config(site_packages_dir):
+    global PIPPER_CONFIG, PIPPER_CONFIG_PATH, VERBOSE_PREFLIGHT
+
+    PIPPER_CONFIG_PATH = _get_default_config_path(site_packages_dir)
+    config = dict(PIPPER_CONFIG)
+
+    if os.path.exists(PIPPER_CONFIG_PATH):
+        try:
+            with open(PIPPER_CONFIG_PATH, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for key in config:
+                    if key in data:
+                        config[key] = data[key]
+        except Exception as e:
+            _warning("Could not load Pipper config: {}".format(e))
+
+    PIPPER_CONFIG = config
+    VERBOSE_PREFLIGHT = bool(PIPPER_CONFIG.get("verbose_preflight", False))
+    return PIPPER_CONFIG
+
+
+def save_pipper_config():
+    if not PIPPER_CONFIG_PATH:
+        return False
+
+    try:
+        directory = os.path.dirname(PIPPER_CONFIG_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        _atomic_write_json(PIPPER_CONFIG_PATH, PIPPER_CONFIG)
+        return True
+    except Exception as e:
+        _warning("Could not save Pipper config: {}".format(e))
+        return False
+
+
+def set_config_value(key, value):
+    PIPPER_CONFIG[key] = value
+    save_pipper_config()
+
+
+def is_wheel_only_enabled():
+    return bool(PIPPER_CONFIG.get("wheel_only", False))
+
+
+def show_pipper_config():
+    print("\n⚙️ Pipper Config")
+    print("   Config path: {}".format(PIPPER_CONFIG_PATH or "(not loaded)"))
+    print("   Verbose preflight: {}".format("ON" if VERBOSE_PREFLIGHT else "OFF"))
+    print("   Wheel-only mode: {}".format("ON" if is_wheel_only_enabled() else "OFF"))
+    print("   Export dir override: {}".format(PIPPER_CONFIG.get("export_dir") or "(auto)"))
+
+
+
+
+# =============================================================================
+# Local archive install helper
+# =============================================================================
+
+def install_local_archive(site_packages_dir, tracker):
+    path = _prompt_local_file_path("Local .whl/.zip path: ")
+    if not path:
+        return False
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".whl", ".zip"):
+        _error("Only .whl and .zip files are supported for local archive install.")
+        return False
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        TrustGate.assert_safe_download_size(data)
+        with ZipFile(BytesIO(data)) as arch:
+            TrustGate.assert_safe_archive(arch, site_packages_dir)
+    except Exception as e:
+        _error("Local archive validation failed: {}".format(e))
+        return False
+
+    package_token = os.path.basename(path)
+    canonical_name = PackageIdentity.canonicalize(os.path.splitext(package_token)[0])
+
+    if not _prompt_yes_no("Install local archive {}?".format(package_token), default_no=True):
+        return False
+
+    initial_state = _scan_directory_state(site_packages_dir)
+
+    ok = run_pip_command([
+        "install",
+        "--upgrade",
+        "--target",
+        site_packages_dir,
+        "--no-compile",
+        path,
+    ])
+
+    if ok:
+        post_state = _scan_directory_state(site_packages_dir)
+        written = _compute_state_delta(initial_state, post_state)
+        tracker.log_transaction(canonical_name, package_token, "local-archive", "SUCCESS", written)
+        _success("Local archive install recorded in ledger: {}".format(canonical_name))
+        return True
+
+    tracker.add_history_only(canonical_name, package_token, "local-archive", "FAILED")
+    _error("Local archive install failed: {}".format(package_token))
+    return False
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -2847,7 +3034,21 @@ class CLI(object):
     def handle_toggle_verbose_preflight(self):
         global VERBOSE_PREFLIGHT
         VERBOSE_PREFLIGHT = not VERBOSE_PREFLIGHT
-        print("Verbose preflight is now {} (resets on restart).".format("ON" if VERBOSE_PREFLIGHT else "OFF"))
+        set_config_value("verbose_preflight", bool(VERBOSE_PREFLIGHT))
+        print("Verbose preflight is now {}.".format("ON" if VERBOSE_PREFLIGHT else "OFF"))
+
+    def handle_toggle_wheel_only(self):
+        new_value = not is_wheel_only_enabled()
+        set_config_value("wheel_only", bool(new_value))
+        print("Wheel-only mode is now {}.".format("ON" if new_value else "OFF"))
+        if new_value:
+            _notice("PyPI installs will use --only-binary :all: to avoid source builds.")
+
+    def handle_local_archive_install(self):
+        install_local_archive(self.site_packages_dir, self.tracker)
+
+    def handle_show_config(self):
+        show_pipper_config()
 
     def handle_session_tools(self):
         prompt_session_tools()
@@ -2876,8 +3077,11 @@ class CLI(object):
             "   e (export ledger / requirements)\n"
             "   b (batch install requirements.txt)\n"
             "   f (freeze scan export)\n"
+            "   o (install local .whl/.zip)\n"
+            "   w (toggle wheel-only mode)\n"
             "   v (toggle verbose preflight)\n"
             "   m (memory/session status)\n"
+            "   p (show Pipper config)\n"
             "   q (quit)\n".format(len(PRESET_PACKAGES))
         )
 
@@ -2902,8 +3106,11 @@ class CLI(object):
             "e": self.handle_export_ledger,
             "b": self.handle_requirements_install,
             "f": self.handle_freeze_export,
+            "o": self.handle_local_archive_install,
+            "w": self.handle_toggle_wheel_only,
             "v": self.handle_toggle_verbose_preflight,
             "m": self.handle_session_tools,
+            "p": self.handle_show_config,
         }
 
         handler = dispatch.get(action)
@@ -2977,11 +3184,43 @@ def _self_test_gist_filenames():
 
 
 def _self_test_record_path_safety():
-    base = _real_abs(os.getcwd())
-    assert _safe_record_path_to_relpath("pkg/__init__.py", "pkg-1.dist-info", base) == "pkg/__init__.py"
-    assert _safe_record_path_to_relpath("../evil.py", "pkg-1.dist-info", base) is None
-    assert _safe_record_path_to_relpath("pkg/../../evil.py", "pkg-1.dist-info", base) is None
-    assert _safe_record_path_to_relpath("/tmp/evil.py", "pkg-1.dist-info", base) is None
+    import tempfile
+    temp_base = tempfile.mkdtemp()
+    try:
+        base = _real_abs(temp_base)
+        assert _safe_record_path_to_relpath("pkg/__init__.py", "pkg-1.dist-info", base) == "pkg/__init__.py"
+        assert _safe_record_path_to_relpath("../evil.py", "pkg-1.dist-info", base) is None
+        assert _safe_record_path_to_relpath("pkg/../../evil.py", "pkg-1.dist-info", base) is None
+        assert _safe_record_path_to_relpath("/tmp/evil.py", "pkg-1.dist-info", base) is None
+    finally:
+        try:
+            shutil.rmtree(temp_base)
+        except Exception:
+            pass
+
+
+def _self_test_requirement_split():
+    assert _split_requirement_for_install("requests==2.31.0", "requests") == ("requests", "==2.31.0")
+    assert _split_requirement_for_install("beautifulsoup4>=4", "beautifulsoup4") == ("beautifulsoup4", ">=4")
+
+
+def _self_test_owner_cleanup():
+    import tempfile
+    temp_dir = tempfile.mkdtemp()
+    try:
+        tracker = ManifestTracker(os.path.join(temp_dir, "installed.json"))
+        tracker.log_transaction("demo", "1.0", "test", "SUCCESS", ["old.py", "keep.py"])
+        tracker.log_transaction("demo", "1.1", "test", "SUCCESS", ["new.py", "keep.py"])
+        ledger = tracker.load_ledger()
+        owners = ledger["packages"]["demo"]["owners"]
+        assert "old.py" not in owners
+        assert "new.py" in owners
+        assert "keep.py" in owners
+    finally:
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
 
 
 def run_self_tests():
@@ -2992,6 +3231,8 @@ def run_self_tests():
     _self_test_gist_parser()
     _self_test_gist_filenames()
     _self_test_record_path_safety()
+    _self_test_requirement_split()
+    _self_test_owner_cleanup()
     _success("Self tests passed.")
 
 
@@ -3057,15 +3298,21 @@ def ensure_packaging_available(site_packages_dir):
 # =============================================================================
 
 def main():
-    _banner("🎉 Hardened Pythonista Package Architecture (Pipper)")
+    _banner("🎉 Pipper v{} - Hardened Pythonista Package Manager".format(PIPPER_VERSION))
 
     if not _HAS_PACKAGING:
         _warn_degraded_validation()
+
+    if "--self-test" in sys.argv:
+        run_self_tests()
+        return
 
     site_packages_dir = _find_site_packages_dir()
 
     if not site_packages_dir:
         sys.exit("❌ Architecture Error: Cannot isolate root runtime directory.")
+
+    load_pipper_config(site_packages_dir)
 
     if not _HAS_PACKAGING:
         ensure_packaging_available(site_packages_dir)
@@ -3080,16 +3327,12 @@ def main():
         gist_folder_dir=gist_folder_dir,
     )
 
-    if "--self-test" in sys.argv:
-        run_self_tests()
-        return
-
     try:
         import pip  # noqa: F401
     except ImportError:
         try:
             bootstrap_pip(site_packages_dir)
-            print("\nℹ️  Pipper is now exiting.")
+            print("\ni️  Pipper is now exiting.")
             print("   Please restart Pythonista and run Pipper again.")
         except RuntimeError as err:
             sys.exit("❌ Initialization Fault: {}".format(err))
