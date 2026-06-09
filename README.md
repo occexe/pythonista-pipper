@@ -16,7 +16,9 @@ It provides:
 
 Pipper was built specifically for Pythonista’s limitations, where traditional desktop package management workflows often fail.
 
-⸻
+## Screenshot
+
+![Pipper Menu](screenshots/menu.png)
 
 Why Use Pipper Instead of Raw pip?
 
